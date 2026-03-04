@@ -3,6 +3,11 @@
 Desktop application for extracting mobility (μ) and threshold voltage (Vth) 
 from FET transfer characteristics using the saturation-regime model.
 
+## Download
+
+Download the latest version from:
+https://github.com/seihou-jinnai/fet-analyzer/releases/latest
+
 ## Features
 
 - Import Keithley Excel files
