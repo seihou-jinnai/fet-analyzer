@@ -36,6 +36,16 @@ https://github.com/seihou-jinnai/fet-analyzer/releases/latest
 
 Seihou Jinnai
 
+## Version history
+
+v1.0.1
+- Improved fitting validation.
+- Added transfer-trend validation for fitting
+- Prevented fitting on datasets that do not exhibit valid FET behavior
+
+v1.0.0
+- Initial release.
+
 ## License
 
 MIT License
