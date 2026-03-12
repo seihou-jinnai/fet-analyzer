@@ -11,11 +11,23 @@
 #   - Run an analysis based on the saturation-regime equation
 #   - Export:
 #       * One PNG plot per item in the Execution list
-#       * One CSV summary containing the inputs + fitted outputs (mobility, Vth, fit range, R2, status)
+#       * One CSV summary containing the inputs + fitted outputs
+#         (mobility, Vth, fit range, R2, status)
 #
-# IMPORTANT REQUIREMENT (as requested):
-#   - The original source code is NOT changed.
-#   - Only extensive English comments are added.
+# IMPORTANT UPDATE IN THIS VERSION:
+#   The fitting logic has been improved so that only physically meaningful transfer
+#   trends are accepted:
+#
+#   - p-type:
+#       As V_G becomes smaller (more negative), |I_D| must become larger.
+#       Equivalently, if data are sorted by increasing V_G, sqrt(|I_D|) must decrease.
+#
+#   - n-type:
+#       As V_G becomes larger (more positive), |I_D| must become larger.
+#       Equivalently, if data are sorted by increasing V_G, sqrt(|I_D|) must increase.
+#
+#   This prevents "successful" fitting on data that do not actually show a valid FET
+#   transfer characteristic in the expected direction.
 # ======================================================================================
 
 from __future__ import annotations  # Enable forward references in type hints (Python 3.7+)
@@ -127,17 +139,28 @@ def apply_light_fusion_theme(app: QApplication) -> None:
 #       - R^2 of the fit
 #   5) Generates two-panel plots and saves them as PNG
 #
-# Design choices (as implemented in this code):
-#   - P-type currents are plotted with sign inversion (so -I_D becomes positive).
-#   - N-type currents are plotted as-is.
-#   - The fit is performed on the forward sweep of sqrt(|I_D|).
-#   - Fit window can be either:
-#       * "span"  : best window of given V span chosen by max R^2
-#       * "range" : fixed [vmin, vmax] window
-#   - Dotted fit line is drawn from the fit window edge toward the x-intercept.
+# IMPORTANT DESIGN UPDATE:
+#   In this version, fit candidates are accepted only if they show the expected
+#   transfer direction for the selected device type:
+#
+#   p-type:
+#       smaller / more negative V_G  -> larger |I_D|
+#       therefore, after sorting by increasing V_G:
+#           sqrt(|I_D|) should decrease
+#           fitted slope should be negative
+#
+#   n-type:
+#       larger / more positive V_G -> larger |I_D|
+#       therefore, after sorting by increasing V_G:
+#           sqrt(|I_D|) should increase
+#           fitted slope should be positive
+#
+#   This prevents false fits on data that do not actually exhibit the expected
+#   field-effect trend.
 # ======================================================================================
 
 FitMode = Literal["span", "range"]  # Fit window selection mode
+
 
 @dataclass(frozen=True)
 class FitWindowSpec:
@@ -157,6 +180,7 @@ class FitWindowSpec:
 #   1.15E-08
 #   +3.2e+5
 _NUM_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
+
 
 def _parse_float_token(tok: str) -> float:
     """
@@ -203,6 +227,7 @@ def _parse_float_token(tok: str) -> float:
 _RANGE2_RE = re.compile(
     r"^\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*-\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$"
 )
+
 
 def parse_fit_window_gui(text: str) -> FitWindowSpec:
     """
@@ -295,8 +320,8 @@ def _split_forward_return(vg: List[float], y: List[float]) -> Tuple[List[float],
     y_f = y[:turn]
 
     # Return sweep: include the turning point for continuity (turn-1 -> end)
-    vg_r = vg[turn - 1 :] if turn - 1 >= 0 else vg[:]
-    y_r = y[turn - 1 :] if turn - 1 >= 0 else y[:]
+    vg_r = vg[turn - 1:] if turn - 1 >= 0 else vg[:]
+    y_r = y[turn - 1:] if turn - 1 >= 0 else y[:]
 
     return vg_f, y_f, vg_r, y_r, turn
 
@@ -346,16 +371,89 @@ def _linfit_r2(x: List[float], y: List[float]) -> Tuple[float, float, float]:
     return a, b, r2
 
 
-def _best_window_fit_span(vg: List[float], ysqrt: List[float], *, span_v: float) -> Dict[str, Any]:
+def _is_valid_transfer_trend(vg: List[float], ysqrt: List[float], dev_type: Literal["p", "n"]) -> bool:
+    """
+    Check whether the selected region shows the physically expected transfer trend.
+
+    Why this is needed:
+      A purely mathematical line fit can still succeed even when the dataset does not
+      show a real field-effect transfer characteristic in the expected direction.
+      For example:
+        - a p-type device whose |ID| becomes smaller as VG becomes more negative
+        - an n-type device whose |ID| becomes smaller as VG becomes more positive
+
+      Those cases should be rejected, even if R^2 happens to be high.
+
+    Expected trend:
+      - p-type:
+            as VG becomes smaller (more negative), |ID| should increase
+            -> if we sort VG in ascending order, sqrt(|ID|) should decrease
+            -> slope should be negative
+      - n-type:
+            as VG becomes larger (more positive), |ID| should increase
+            -> if we sort VG in ascending order, sqrt(|ID|) should increase
+            -> slope should be positive
+
+    The check is intentionally simple and robust:
+      1) Sort points by VG so the interpretation is independent of sweep direction.
+      2) Perform a linear fit on the sorted data.
+      3) Require both:
+         - expected slope sign
+         - expected endpoint direction
+
+    Returns:
+      True  -> acceptable transfer trend
+      False -> invalid / opposite / indeterminate trend
+    """
+    if len(vg) < 2 or len(ysqrt) < 2:
+        return False
+
+    # Sort by VG so the trend rule is evaluated in a consistent voltage direction.
+    xy = sorted(zip(vg, ysqrt), key=lambda t: t[0])
+    xs = [t[0] for t in xy]
+    ys = [t[1] for t in xy]
+
+    try:
+        a, b, r2 = _linfit_r2(xs, ys)
+    except ValueError:
+        return False
+
+    # Net endpoint trend:
+    #   positive -> overall increase with increasing VG
+    #   negative -> overall decrease with increasing VG
+    dy = ys[-1] - ys[0]
+
+    if dev_type == "p":
+        # For p-type, increasing VG (less negative) should reduce |ID|:
+        # therefore y should decrease with increasing VG.
+        return (a < 0) and (dy < 0)
+    else:
+        # For n-type, increasing VG should increase |ID|:
+        # therefore y should increase with increasing VG.
+        return (a > 0) and (dy > 0)
+
+
+def _best_window_fit_span(
+    vg: List[float],
+    ysqrt: List[float],
+    *,
+    span_v: float,
+    dev_type: Literal["p", "n"],
+) -> Dict[str, Any]:
     """
     Search for the best contiguous window that spans at least span_v volts in VG,
     and select the one that maximizes R^2 of the linear fit.
+
+    IMPORTANT:
+      Not every mathematically linear region is physically acceptable.
+      Therefore, each candidate window is first tested by _is_valid_transfer_trend().
+      Only windows with the expected p-type / n-type transfer direction are allowed.
 
     Returns dict with:
       start, end, a, b, r2, xw, yw
 
     Raises:
-      ValueError if no window meets criteria.
+      ValueError if no valid window meets criteria.
     """
     n = len(vg)
     if n < 3:
@@ -382,8 +480,13 @@ def _best_window_fit_span(vg: List[float], ysqrt: List[float], *, span_v: float)
             break
 
         # Slice the candidate window
-        xw = vg[start : end + 1]
-        yw = ysqrt[start : end + 1]
+        xw = vg[start:end + 1]
+        yw = ysqrt[start:end + 1]
+
+        # Reject windows that do not show the expected transfer direction.
+        # This is the key improvement preventing false fits on "wrong-way" data.
+        if not _is_valid_transfer_trend(xw, yw, dev_type):
+            continue
 
         # Fit and compute R^2
         try:
@@ -399,20 +502,35 @@ def _best_window_fit_span(vg: List[float], ysqrt: List[float], *, span_v: float)
             best = cand
 
     if best is None:
-        raise ValueError(f"Failed to find a valid >= {span_v:g} V-span window for fitting.")
+        raise ValueError(
+            f"Failed to find a valid >= {span_v:g} V-span window with the expected "
+            f"{'p-type' if dev_type == 'p' else 'n-type'} transfer trend."
+        )
 
     return best
 
 
-def _fit_fixed_range(vg: List[float], ysqrt: List[float], *, vmin: float, vmax: float) -> Dict[str, Any]:
+def _fit_fixed_range(
+    vg: List[float],
+    ysqrt: List[float],
+    *,
+    vmin: float,
+    vmax: float,
+    dev_type: Literal["p", "n"],
+) -> Dict[str, Any]:
     """
     Fit using all points where vmin <= VG <= vmax.
+
+    IMPORTANT:
+      The specified range is not accepted automatically.
+      Even if the points are numerous enough, the range is rejected if it does not
+      show the expected transfer direction for the selected device type.
 
     Returns dict with:
       a, b, r2, xw, yw, vmin, vmax
 
     Raises:
-      ValueError if fewer than 2 points exist in the range.
+      ValueError if fewer than 2 points exist in the range, or if the trend is invalid.
     """
     # Normalize ordering
     if vmin > vmax:
@@ -430,6 +548,13 @@ def _fit_fixed_range(vg: List[float], ysqrt: List[float], *, vmin: float, vmax: 
     # At least two points are needed for linear regression
     if len(xw) < 2:
         raise ValueError(f"Not enough points in fit range [{vmin:g}, {vmax:g}] V (need >= 2).")
+
+    # Reject the range if it does not show the expected transfer trend.
+    if not _is_valid_transfer_trend(xw, yw, dev_type):
+        raise ValueError(
+            f"The selected fit range [{vmin:g}, {vmax:g}] V does not show the expected "
+            f"{'p-type' if dev_type == 'p' else 'n-type'} transfer trend."
+        )
 
     a, b, r2 = _linfit_r2(xw, yw)
     return {"a": a, "b": b, "r2": r2, "xw": xw, "yw": yw, "vmin": vmin, "vmax": vmax}
@@ -471,7 +596,7 @@ def analyze_fet_and_save_figure(
       Right: sqrt(|ID|) vs VG with fitted dotted line
 
     Note about Comment:
-      - Comment is intentionally NOT plotted (per your final requirement),
+      - Comment is intentionally NOT plotted,
         but it is still carried along for CSV export in the calling code.
     """
     # Basic input validation: arrays must be same length and non-empty.
@@ -486,7 +611,8 @@ def analyze_fet_and_save_figure(
     # Split the ID trace into forward and return sweeps for plotting
     vg_f, id_f, vg_r, id_r, _ = _split_forward_return(vg, id_plot)
 
-    # Prepare sqrt(|ID|) for fitting. Fitting is done on sqrt of absolute current magnitude.
+    # Prepare sqrt(|ID|) for fitting.
+    # Fitting is done on the square root of the absolute current magnitude.
     ysqrt_all = [math.sqrt(abs(v)) for v in id_plot]
     vg_f2, y_f2, vg_r2, y_r2, _ = _split_forward_return(vg, ysqrt_all)
 
@@ -494,10 +620,11 @@ def analyze_fet_and_save_figure(
     # Determine the fit window
     # -------------------------
     if fit_spec.mode == "span":
-        # Search the forward sweep for the best window (by R^2) spanning span_v volts
+        # Search the forward sweep for the best window (by R^2),
+        # but only among windows showing the expected p/n transfer direction.
         if fit_spec.span_v is None:
             raise ValueError("Internal error: span_v is None.")
-        fit = _best_window_fit_span(vg_f2, y_f2, span_v=fit_spec.span_v)
+        fit = _best_window_fit_span(vg_f2, y_f2, span_v=fit_spec.span_v, dev_type=dev_type)
         x_used = fit["xw"]
         a = float(fit["a"])
         b = float(fit["b"])
@@ -505,10 +632,10 @@ def analyze_fet_and_save_figure(
         fit_vmin = float(min(x_used))
         fit_vmax = float(max(x_used))
     else:
-        # Use a fixed range, and fit only points inside it
+        # Use a fixed range, but reject it if the trend direction is physically wrong.
         if fit_spec.vmin is None or fit_spec.vmax is None:
             raise ValueError("Internal error: vmin/vmax is None.")
-        fit = _fit_fixed_range(vg_f2, y_f2, vmin=fit_spec.vmin, vmax=fit_spec.vmax)
+        fit = _fit_fixed_range(vg_f2, y_f2, vmin=fit_spec.vmin, vmax=fit_spec.vmax, dev_type=dev_type)
         x_used = fit["xw"]
         a = float(fit["a"])
         b = float(fit["b"])
@@ -627,8 +754,7 @@ def analyze_fet_and_save_figure(
     axL.text(0.5, -0.25, left_note, transform=axL.transAxes, ha="center", va="top")
     axR.text(0.5, -0.25, right_note, transform=axR.transAxes, ha="center", va="top")
 
-    # reduce bottom margin now that comment is gone
-    # (previously, extra bottom space might have been used to show comment)
+    # Reduce bottom margin now that comment is gone
     fig.subplots_adjust(bottom=0.28, top=0.90, wspace=0.28)
 
     # Ensure output directory exists (creates intermediate folders if needed)
@@ -696,9 +822,6 @@ def _coerce_numeric_series(series: pd.Series) -> pd.Series:
 #   2) ExecutionListModel: shows the list of analyses to be executed
 # ======================================================================================
 
-# -----------------------------
-# Models
-# -----------------------------
 class PreviewTableModel(QAbstractTableModel):
     """
     Table model used for previewing the selected sheet.
@@ -814,14 +937,12 @@ class PreviewTableModel(QAbstractTableModel):
             )
         self.headerDataChanged.emit(Qt.Horizontal, 0, max(0, self.columnCount() - 1))
 
-    # ---- Required Qt Model API: dimensions ----
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(self._rows)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(self._headers)
 
-    # ---- Required Qt Model API: cell data + formatting ----
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
         """
         Provide data for each cell depending on role:
@@ -834,7 +955,6 @@ class PreviewTableModel(QAbstractTableModel):
 
         r, c = index.row(), index.column()
 
-        # Display value
         if role in (Qt.DisplayRole, Qt.EditRole):
             try:
                 v = self._rows[r][c]
@@ -842,7 +962,6 @@ class PreviewTableModel(QAbstractTableModel):
                 v = ""
             return "" if v is None else str(v)
 
-        # Background coloring logic
         if role == Qt.BackgroundRole:
             # Committed roles take priority over soft selection
             if self.isd_col is not None and self.vg_col is not None and c == self.isd_col == self.vg_col:
@@ -884,22 +1003,18 @@ class PreviewTableModel(QAbstractTableModel):
         return f"{name}{tag}"
 
 
-# --------------------------------------------------------------------------------------
-# Data record stored for each "Execution list" entry.
-# This is what gets analyzed when the user hits Execute.
-# --------------------------------------------------------------------------------------
 @dataclass
 class ExecRow:
-    file_name: str       # Base filename (e.g., "data1.xls")
-    sheet_name: str      # Sheet tab name
-    w: str               # W input as string (parsed later)
-    l: str               # L input as string
-    c: str               # C input as string (F/cm^2)
-    fit_window_v: str    # Fit window input string (span or range)
-    pn: str              # "P" or "N"
-    i_sd: str            # Selected I-SD column index (1-based as shown to user)
-    v_g: str             # Selected V-G column index (1-based)
-    comment: str         # User comment, stored in CSV (not plotted)
+    file_name: str
+    sheet_name: str
+    w: str
+    l: str
+    c: str
+    fit_window_v: str
+    pn: str
+    i_sd: str
+    v_g: str
+    comment: str
 
 
 class ExecutionListModel(QAbstractTableModel):
@@ -923,12 +1038,6 @@ class ExecutionListModel(QAbstractTableModel):
         return len(self.HEADERS)
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
-        """
-        Provide display text for each cell in the execution list.
-
-        Note:
-          "#" is computed as row_idx+1 (not stored in ExecRow).
-        """
         if not index.isValid() or role != Qt.DisplayRole:
             return None
 
@@ -936,7 +1045,7 @@ class ExecutionListModel(QAbstractTableModel):
         r = self._rows[row_idx]
 
         values = [
-            str(row_idx + 1),   # auto index
+            str(row_idx + 1),
             r.file_name,
             r.sheet_name,
             r.w,
@@ -951,7 +1060,6 @@ class ExecutionListModel(QAbstractTableModel):
         return values[index.column()]
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
-        # Header labels for the table.
         if role != Qt.DisplayRole:
             return None
         if orientation == Qt.Horizontal:
@@ -959,23 +1067,11 @@ class ExecutionListModel(QAbstractTableModel):
         return str(section + 1)
 
     def add_row(self, row: ExecRow) -> None:
-        """
-        Append one row to the model.
-        beginInsertRows/endInsertRows informs Qt view to update efficiently.
-        """
         self.beginInsertRows(QModelIndex(), len(self._rows), len(self._rows))
         self._rows.append(row)
         self.endInsertRows()
 
     def remove_rows(self, rows_to_remove: List[int]) -> None:
-        """
-        Remove rows by indices (0-based), safe for unsorted / duplicates.
-
-        Implementation:
-          - De-duplicate
-          - Sort descending so deletion does not shift remaining indices incorrectly
-          - Remove one-by-one with beginRemoveRows/endRemoveRows
-        """
         uniq = sorted(set(r for r in rows_to_remove if 0 <= r < len(self._rows)), reverse=True)
         if not uniq:
             return
@@ -988,126 +1084,83 @@ class ExecutionListModel(QAbstractTableModel):
 # ======================================================================================
 # Drag & drop line edit
 # ======================================================================================
-# This subclass enables drag-and-drop of files directly onto a QLineEdit.
-# It passes dropped file paths to the MainWindow.open_files() method.
-# ======================================================================================
 
 class DropLineEdit(QLineEdit):
     def __init__(self, placeholder: str = ""):
         super().__init__()
         self.setPlaceholderText(placeholder)
-        self.setAcceptDrops(True)  # Enable drop events on this widget
+        self.setAcceptDrops(True)
 
     def dragEnterEvent(self, event):
-        # Accept if payload contains URLs (file drops are represented as URLs).
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dropEvent(self, event):
-        # Extract local file paths from dropped URLs
         urls = event.mimeData().urls()
         paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
 
-        # Find a parent widget that has open_files method (MainWindow)
         parent = self.parent()
         while parent is not None and not hasattr(parent, "open_files"):
             parent = parent.parent()
 
-        # Delegate the actual file opening to the MainWindow
         if parent is not None:
             parent.open_files(paths)  # type: ignore[arg-type]
 
         event.acceptProposedAction()
 
 
-# --------------------------------------------------------------------------------------
-# Container for opened Excel file cache.
-# We keep the ExcelFile object so we can re-parse sheets quickly without reopening.
-# --------------------------------------------------------------------------------------
 @dataclass
 class OpenedBook:
-    path: str                 # full filesystem path
-    excel: pd.ExcelFile       # pandas ExcelFile handle
-    sheet_names: List[str]    # available sheet names
+    path: str
+    excel: pd.ExcelFile
+    sheet_names: List[str]
 
 
 # ======================================================================================
 # Main Window (GUI)
-# ======================================================================================
-# This class builds the entire UI and orchestrates:
-#   - opening files
-#   - previewing sheets
-#   - selecting columns
-#   - adding execution entries
-#   - executing analysis batch and exporting PNG + CSV
 # ======================================================================================
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # Window title shown in OS window decoration
         self.setWindowTitle("FET Mobility Analyzer")
-
-        # Default window size
         self.resize(1020, 820)
-
-        # Allow dropping files onto the main window (not only the drop line edit)
         self.setAcceptDrops(True)
 
-        # Map from full file path -> OpenedBook (Excel cache)
         self.books: Dict[str, OpenedBook] = {}
-
-        # Track the currently selected file path (full path)
         self.current_path: Optional[str] = None
 
-        # Table models used in the UI
         self.exec_model = ExecutionListModel()
         self.preview_model = PreviewTableModel()
 
-        # Build menu bar and central UI layout
         self._build_menu()
         self._build_ui()
 
-    # --------------------
-    # Drag/Drop (window-level)
-    # --------------------
     def dragEnterEvent(self, event):
-        # Accept drag if it contains URLs (files).
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
-        # Convert dropped URLs into local file paths
         urls = event.mimeData().urls()
         paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
-
-        # Open dropped files
         if paths:
             self.open_files(paths)
-
         event.acceptProposedAction()
 
-    # --------------------
-    # Menu
-    # --------------------
     def _build_menu(self) -> None:
-        # Create and attach the menu bar
         menubar = QMenuBar(self)
         self.setMenuBar(menubar)
 
-        # "Open" menu: open Excel files via file dialog
         m_open = menubar.addMenu("Open")
         act_open = QAction("Open Excel…", self)
         m_open.addAction(act_open)
         act_open.triggered.connect(self.on_open_dialog)
 
-        # ---- How to use (instead of About) ----
-        # The text is shown as a modal information dialog when clicked.
         m_help = menubar.addMenu("How to use")
         act_help = QAction("How to use", self)
         m_help.addAction(act_help)
@@ -1128,7 +1181,6 @@ class MainWindow(QMainWindow):
             "S"
         )
 
-        # Connect action to an informational message box
         act_help.triggered.connect(
             lambda: QMessageBox.information(
                 self,
@@ -1137,22 +1189,14 @@ class MainWindow(QMainWindow):
             )
         )
 
-    # --------------------
-    # UI layout
-    # --------------------
     def _build_ui(self) -> None:
-        # Central widget acts as the root container for layouts
         root = QWidget()
         self.setCentralWidget(root)
 
-        # Outer vertical layout for the whole window
         outer = QVBoxLayout(root)
         outer.setContentsMargins(14, 14, 14, 14)
         outer.setSpacing(12)
 
-        # -------------------------
-        # (1) Input group box
-        # -------------------------
         gb_input = QGroupBox("(1) Input")
         outer.addWidget(gb_input)
 
@@ -1160,12 +1204,10 @@ class MainWindow(QMainWindow):
         input_layout.setSpacing(28)
         input_layout.setContentsMargins(12, 10, 12, 12)
 
-        # Left side: file/sheet/comment
         left = QVBoxLayout()
         left.setSpacing(10)
         input_layout.addLayout(left, stretch=3)
 
-        # Row: Open (drag/drop + button)
         row_open = QHBoxLayout()
         row_open.setSpacing(10)
         left.addLayout(row_open)
@@ -1174,17 +1216,14 @@ class MainWindow(QMainWindow):
         lbl_open.setFixedWidth(78)
         row_open.addWidget(lbl_open)
 
-        # Drag & drop entry line (calls open_files on drop)
         self.le_drop = DropLineEdit("(drag and drop)")
         row_open.addWidget(self.le_drop, stretch=1)
 
-        # Open file dialog button
         self.btn_open_xls = QPushButton("Open xls")
         self.btn_open_xls.setFixedWidth(120)
         self.btn_open_xls.clicked.connect(self.on_open_dialog)
         row_open.addWidget(self.btn_open_xls)
 
-        # Row: Select file dropdown
         row_file = QHBoxLayout()
         row_file.setSpacing(10)
         left.addLayout(row_file)
@@ -1197,7 +1236,6 @@ class MainWindow(QMainWindow):
         self.cb_file.currentIndexChanged.connect(self.on_file_changed)
         row_file.addWidget(self.cb_file, stretch=1)
 
-        # Row: Select sheet dropdown
         row_sheet = QHBoxLayout()
         row_sheet.setSpacing(10)
         left.addLayout(row_sheet)
@@ -1210,7 +1248,6 @@ class MainWindow(QMainWindow):
         self.cb_sheet.currentIndexChanged.connect(self.on_sheet_changed)
         row_sheet.addWidget(self.cb_sheet, stretch=1)
 
-        # Row: Comment (multi-line text)
         row_comment = QHBoxLayout()
         row_comment.setSpacing(10)
         left.addLayout(row_comment)
@@ -1222,18 +1259,14 @@ class MainWindow(QMainWindow):
 
         self.te_comment = QTextEdit()
         self.te_comment.setPlaceholderText("Optional notes…")
-
-        # Set comment box height to ~3 lines for usability
         fm = self.te_comment.fontMetrics()
         self.te_comment.setFixedHeight(int(fm.lineSpacing() * 3.2) + 18)
         row_comment.addWidget(self.te_comment, stretch=1)
 
-        # Right side: W/L/C/fit window/type inputs
         right = QVBoxLayout()
         right.setSpacing(10)
         input_layout.addLayout(right, stretch=2)
 
-        # Helper to create a labeled QLineEdit row
         def form_row(label: str) -> tuple[QHBoxLayout, QLineEdit]:
             r = QHBoxLayout()
             r.setSpacing(10)
@@ -1245,13 +1278,11 @@ class MainWindow(QMainWindow):
             r.addWidget(le, stretch=1)
             return r, le
 
-        # Device parameters and fit window input fields
         r_w, self.le_w = form_row("W (µm)")
         r_l, self.le_l = form_row("L (µm)")
         r_c, self.le_c = form_row("C (F/cm²)")
         r_fw, self.le_fitwin = form_row("fit window (V)")
 
-        # Placeholder guidance for user input format
         self.le_w.setPlaceholderText("e.g., 1000")
         self.le_l.setPlaceholderText("e.g., 30")
         self.le_c.setPlaceholderText("e.g., 1.15E-08")
@@ -1262,7 +1293,6 @@ class MainWindow(QMainWindow):
         right.addLayout(r_c)
         right.addLayout(r_fw)
 
-        # Device type radio buttons
         type_row = QHBoxLayout()
         type_row.setSpacing(10)
         lab_type = QLabel("Type")
@@ -1271,22 +1301,18 @@ class MainWindow(QMainWindow):
 
         self.rb_p = QRadioButton("p-type")
         self.rb_n = QRadioButton("n-type")
-        self.rb_p.setChecked(True)  # default: p-type
+        self.rb_p.setChecked(True)
 
         type_row.addWidget(self.rb_p)
         type_row.addWidget(self.rb_n)
         type_row.addStretch(1)
         right.addLayout(type_row)
 
-        # -------------------------
-        # (2) Select column group box
-        # -------------------------
         gb_sel = QGroupBox("(2) Select column")
         outer.addWidget(gb_sel, stretch=1)
         sel_layout = QVBoxLayout(gb_sel)
         sel_layout.setSpacing(10)
 
-        # Top control row: pick label + role assignment buttons
         ctrl_row = QHBoxLayout()
         ctrl_row.setSpacing(10)
         sel_layout.addLayout(ctrl_row)
@@ -1307,7 +1333,6 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(self.btn_set_vg)
         ctrl_row.addWidget(self.btn_clear_cols)
 
-        # Preview table: displays the sheet preview data
         self.tbl_preview = QTableView()
         self.tbl_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tbl_preview.setFrameShape(QFrame.Box)
@@ -1319,16 +1344,13 @@ class MainWindow(QMainWindow):
         self.tbl_preview.setSelectionMode(QTableView.SingleSelection)
         sel_layout.addWidget(self.tbl_preview, stretch=1)
 
-        # Wire interactions: clicking a header or cell selects that column in the preview model
         self.tbl_preview.horizontalHeader().sectionClicked.connect(self.on_preview_column_clicked)
         self.tbl_preview.clicked.connect(self.on_preview_cell_clicked)
 
-        # Wire buttons: commit selected column as I-SD or V-G, or clear
         self.btn_set_isd.clicked.connect(self.on_set_isd)
         self.btn_set_vg.clicked.connect(self.on_set_vg)
         self.btn_clear_cols.clicked.connect(self.on_clear_cols)
 
-        # Add row button: pushes the current configuration into the execution list
         add_row = QHBoxLayout()
         add_row.addStretch(1)
         self.btn_add = QPushButton("add")
@@ -1337,15 +1359,11 @@ class MainWindow(QMainWindow):
         sel_layout.addLayout(add_row)
         self.btn_add.clicked.connect(self._on_add_clicked)
 
-        # -------------------------
-        # (3) Execution list group box
-        # -------------------------
         gb_exec = QGroupBox("(3) Execution list")
         outer.addWidget(gb_exec, stretch=1)
         exec_layout = QVBoxLayout(gb_exec)
         exec_layout.setSpacing(10)
 
-        # "Clear line" button at top-right: removes selected rows from execution list
         top_exec_row = QHBoxLayout()
         top_exec_row.addStretch(1)
         self.btn_clear_line = QPushButton("Clear line")
@@ -1354,21 +1372,17 @@ class MainWindow(QMainWindow):
         exec_layout.addLayout(top_exec_row)
         self.btn_clear_line.clicked.connect(self._on_clear_line_clicked)
 
-        # Execution list table view
         self.tbl_exec = QTableView()
         self.tbl_exec.setModel(self.exec_model)
         self.tbl_exec.setFrameShape(QFrame.Box)
         self.tbl_exec.setAlternatingRowColors(True)
         self.tbl_exec.horizontalHeader().setStretchLastSection(True)
         self.tbl_exec.verticalHeader().setVisible(False)
-
-        # Select rows (not individual cells) to facilitate deletion
         self.tbl_exec.setSelectionBehavior(QTableView.SelectRows)
         self.tbl_exec.setSelectionMode(QTableView.ExtendedSelection)
 
         exec_layout.addWidget(self.tbl_exec, stretch=1)
 
-        # Bottom row: export folder selection + Execute button
         exec_btn_row = QHBoxLayout()
         exec_btn_row.setSpacing(10)
 
@@ -1394,20 +1408,9 @@ class MainWindow(QMainWindow):
         exec_layout.addLayout(exec_btn_row)
         self.btn_execute.clicked.connect(self._on_execute_clicked)
 
-        # Initialize dropdowns based on currently loaded books
         self._refresh_file_dropdown()
 
-    # --------------------
-    # Click-to-select column
-    # --------------------
     def on_preview_column_clicked(self, col: int) -> None:
-        """
-        Called when the user clicks a preview table header section.
-
-        Effect:
-          - Sets PreviewTableModel.selected_col
-          - Updates instruction label to show which column is picked
-        """
         if self.preview_model.columnCount() <= 0:
             return
         self.preview_model.set_selected_col(col)
@@ -1415,28 +1418,17 @@ class MainWindow(QMainWindow):
         self.lbl_pick.setText(f"Picked: [{col+1}] {name}")
 
     def on_preview_cell_clicked(self, idx: QModelIndex) -> None:
-        """
-        Clicking any cell is treated the same as clicking that column header,
-        which helps usability (users can click anywhere).
-        """
         if not idx.isValid():
             return
         self.on_preview_column_clicked(idx.column())
 
     def _ensure_pick(self) -> Optional[int]:
-        """
-        Utility to ensure a column has been picked before trying to assign it
-        to a role (I-SD or V-G).
-        """
         col = self.preview_model.selected_col
         if col is None:
             QMessageBox.information(self, "Pick a column", "Please click a column header (or any cell) first.")
         return col
 
     def on_set_isd(self) -> None:
-        """
-        Commit the currently picked column as I-SD, unless it conflicts with V-G.
-        """
         col = self._ensure_pick()
         if col is None:
             return
@@ -1446,9 +1438,6 @@ class MainWindow(QMainWindow):
         self.preview_model.set_isd_col(col)
 
     def on_set_vg(self) -> None:
-        """
-        Commit the currently picked column as V-G, unless it conflicts with I-SD.
-        """
         col = self._ensure_pick()
         if col is None:
             return
@@ -1458,20 +1447,10 @@ class MainWindow(QMainWindow):
         self.preview_model.set_vg_col(col)
 
     def on_clear_cols(self) -> None:
-        """
-        Clear picked/committed columns in preview.
-        """
         self.preview_model.clear_roles()
         self.lbl_pick.setText("Click a column header (or any cell) to pick a column.")
 
-    # --------------------
-    # Open / read excel
-    # --------------------
     def on_open_dialog(self) -> None:
-        """
-        Open a file dialog for selecting Excel files.
-        Supports .xlsx, .xlsm, .xls.
-        """
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Open Excel files",
@@ -1482,15 +1461,6 @@ class MainWindow(QMainWindow):
             self.open_files(paths)
 
     def open_files(self, paths: List[str]) -> None:
-        """
-        Open and cache Excel files.
-
-        - Normalizes and resolves input paths
-        - Opens with pandas.ExcelFile using appropriate engine:
-            * .xls  -> xlrd
-            * others -> openpyxl
-        - Stores each in self.books to avoid re-opening repeatedly.
-        """
         norm_paths: List[str] = []
         for p in paths:
             if not p:
@@ -1509,7 +1479,6 @@ class MainWindow(QMainWindow):
         errors: List[str] = []
 
         for path in norm_paths:
-            # Skip already loaded files
             if path in self.books:
                 opened_any = True
                 continue
@@ -1521,34 +1490,22 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 errors.append(f"{Path(path).name}: {e}")
 
-        # Update UI after opening
         if opened_any:
             self.le_drop.setText(norm_paths[0] if len(norm_paths) == 1 else f"{len(norm_paths)} files loaded")
             sel = self.current_path or norm_paths[0]
             self._refresh_file_dropdown(select_path=sel)
 
-        # Warn if any files failed
         if errors:
             QMessageBox.warning(self, "Some files failed to open", "Failed:\n" + "\n".join(errors))
 
     def _engine_for(self, path: str) -> str:
-        """
-        Choose the pandas Excel engine based on file extension.
-
-        - .xls  -> xlrd
-        - .xlsx/.xlsm -> openpyxl
-        """
         ext = Path(path).suffix.lower()
         return "xlrd" if ext == ".xls" else "openpyxl"
 
     def _refresh_file_dropdown(self, select_path: Optional[str] = None) -> None:
-        """
-        Refresh "Select file" dropdown based on currently loaded files.
-        """
         self.cb_file.blockSignals(True)
         self.cb_file.clear()
 
-        # Sort by base filename for friendly display
         paths = sorted(self.books.keys(), key=lambda p: Path(p).name.lower())
         for p in paths:
             self.cb_file.addItem(Path(p).name, userData=p)
@@ -1556,39 +1513,26 @@ class MainWindow(QMainWindow):
         self.cb_file.blockSignals(False)
 
         if paths:
-            # Select requested path if provided and loaded
             if select_path and select_path in self.books:
                 idx = self._find_file_index(select_path)
                 self.cb_file.setCurrentIndex(idx if idx is not None else 0)
             else:
                 self.cb_file.setCurrentIndex(0)
 
-            # Trigger population of sheet dropdown and preview
             self.on_file_changed()
         else:
-            # No files loaded: clear dependent UI elements
             self.current_path = None
             self.cb_sheet.clear()
             self.preview_model.set_data([], [])
             self.preview_model.clear_roles()
 
     def _find_file_index(self, path: str) -> Optional[int]:
-        """
-        Return the index of a file path in the file dropdown, or None if not found.
-        """
         for i in range(self.cb_file.count()):
             if self.cb_file.itemData(i) == path:
                 return i
         return None
 
     def on_file_changed(self) -> None:
-        """
-        Called when the user selects a different file from "Select file".
-
-        - Updates current_path
-        - Loads sheet names into the sheet dropdown
-        - Triggers on_sheet_changed for the default sheet selection
-        """
         path = self.cb_file.currentData()
         if not path or path not in self.books:
             self.current_path = None
@@ -1600,24 +1544,16 @@ class MainWindow(QMainWindow):
         self.current_path = path
         book = self.books[path]
 
-        # Populate "Select sheet" dropdown
         self.cb_sheet.blockSignals(True)
         self.cb_sheet.clear()
         self.cb_sheet.addItems(book.sheet_names)
         self.cb_sheet.blockSignals(False)
 
-        # Select the first sheet by default
         if book.sheet_names:
             self.cb_sheet.setCurrentIndex(0)
             self.on_sheet_changed()
 
     def on_sheet_changed(self) -> None:
-        """
-        Called when the user selects a different sheet.
-
-        - Reads first 50 rows to show preview
-        - Resets column roles (I-SD/V-G) for the new sheet
-        """
         if not self.current_path:
             return
         sheet = self.cb_sheet.currentText()
@@ -1635,29 +1571,13 @@ class MainWindow(QMainWindow):
             self.preview_model.clear_roles()
             return
 
-        # Convert headers to strings and data to a simple string table for display
         headers = [str(c) for c in df.columns]
         rows: List[List[object]] = df.fillna("").astype(str).values.tolist()
 
         self.preview_model.set_data(headers, rows)
         self.lbl_pick.setText("Click a column header (or any cell) to pick a column.")
 
-    # --------------------
-    # Helpers
-    # --------------------
     def _require_inputs_or_warn(self) -> Optional[dict]:
-        """
-        Validate mandatory numeric input fields before adding to the execution list.
-
-        Required:
-          - W
-          - L
-          - C
-          - fit window
-
-        Returns:
-          dict with raw strings if valid, else None.
-        """
         w = self.le_w.text().strip()
         l = self.le_l.text().strip()
         c = self.le_c.text().strip()
@@ -1684,12 +1604,6 @@ class MainWindow(QMainWindow):
         return {"w": w, "l": l, "c": c, "fitwin": fitwin}
 
     def _find_book_path_by_filename(self, file_name: str) -> Optional[str]:
-        """
-        Map a displayed base filename (e.g., data1.xls) back to the full path
-        in self.books.
-
-        This assumes base filenames are unique among loaded files.
-        """
         target = (file_name or "").strip()
         if not target:
             return None
@@ -1698,14 +1612,7 @@ class MainWindow(QMainWindow):
                 return full_path
         return None
 
-    # --------------------
-    # Add / Execute / Clear line / Export folder
-    # --------------------
     def _on_add_clicked(self) -> None:
-        """
-        Add the current sheet + selected columns + entered parameters
-        to the Execution list.
-        """
         if not self.current_path:
             QMessageBox.warning(self, "No file", "Please open and select a file first.")
             return
@@ -1714,23 +1621,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No sheet", "Please select a sheet.")
             return
 
-        # Both columns must be committed (I-SD and V-G)
         if self.preview_model.isd_col is None or self.preview_model.vg_col is None:
             QMessageBox.warning(self, "Columns not set", "Please set both I-SD and V-G columns.")
             return
 
-        # Validate numeric inputs exist (strings only at this stage)
         req = self._require_inputs_or_warn()
         if req is None:
             return
 
-        # Device type selection -> "P" or "N"
         pn = "P" if self.rb_p.isChecked() else "N"
-
-        # Comment can be empty; it's stored for CSV export
         comment = self.te_comment.toPlainText().strip()
 
-        # Add a row to the execution model
         self.exec_model.add_row(
             ExecRow(
                 file_name=Path(self.current_path).name,
@@ -1740,24 +1641,18 @@ class MainWindow(QMainWindow):
                 c=req["c"],
                 fit_window_v=req["fitwin"],
                 pn=pn,
-                i_sd=str(self.preview_model.isd_col + 1),  # store 1-based column index as string
+                i_sd=str(self.preview_model.isd_col + 1),
                 v_g=str(self.preview_model.vg_col + 1),
                 comment=comment,
             )
         )
 
     def _on_browse_export_clicked(self) -> None:
-        """
-        Open a folder picker dialog and set the export folder line edit.
-        """
         folder = QFileDialog.getExistingDirectory(self, "Select export folder", "")
         if folder:
             self.le_export.setText(folder)
 
     def _on_clear_line_clicked(self) -> None:
-        """
-        Remove selected rows from the execution list.
-        """
         sel = self.tbl_exec.selectionModel()
         if sel is None:
             return
@@ -1779,13 +1674,16 @@ class MainWindow(QMainWindow):
           - Extract VG and ID columns as numeric series
           - Analyze and export PNG plot (named with index prefix)
           - Append results + status to a CSV summary file
+
+        IMPORTANT in this version:
+          Fit may fail intentionally if the data do not show the expected p-type / n-type
+          transfer direction. This is desirable behavior.
         """
         n = self.exec_model.rowCount()
         if n == 0:
             QMessageBox.information(self, "Execute", "Execution list is empty.")
             return
 
-        # Export folder must be chosen and exist
         export_dir = self.le_export.text().strip()
         if not export_dir:
             QMessageBox.warning(self, "Export folder", "Please select an export folder before execute.")
@@ -1795,7 +1693,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export folder", "The selected export folder does not exist.")
             return
 
-        # Redundant safety check: ensure each row has W/L/C/fit window strings
         bad_rows = []
         for i, r in enumerate(self.exec_model._rows, start=1):
             if not (r.w.strip() and r.l.strip() and r.c.strip() and r.fit_window_v.strip()):
@@ -1808,28 +1705,24 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # CSV summary filename is date-stamped
         today = datetime.now().strftime("%Y%m%d")
         csv_path = export_path / f"fet-results_{today}.csv"
 
-        results_rows: List[Dict[str, Any]] = []  # rows to be written to CSV
-        ok = 0                                   # count of successful analyses
-        failed: List[str] = []                   # error summary strings
-        summary_lines: List[str] = []            # short OK summary strings
+        results_rows: List[Dict[str, Any]] = []
+        ok = 0
+        failed: List[str] = []
+        summary_lines: List[str] = []
 
-        # Process each execution entry in order (1-based idx0)
         for idx0, r in enumerate(self.exec_model._rows, start=1):
             status = "OK"
             error_msg = ""
 
-            # Values to be filled (as strings) for CSV
             mobility = ""
             vth = ""
             fit_vmin = ""
             fit_vmax = ""
             r2 = ""
 
-            # Step 1: locate the full path for the selected file
             full_path = self._find_book_path_by_filename(r.file_name)
             if full_path is None or full_path not in self.books:
                 status = "ERROR"
@@ -1837,12 +1730,10 @@ class MainWindow(QMainWindow):
             else:
                 book = self.books[full_path]
 
-                # Step 2: verify sheet exists
                 if r.sheet_name not in book.sheet_names:
                     status = "ERROR"
                     error_msg = "sheet not found"
                 else:
-                    # Step 3: parse device parameters and column indices
                     try:
                         w_um = _parse_float_token(r.w)
                         l_um = _parse_float_token(r.l)
@@ -1857,44 +1748,34 @@ class MainWindow(QMainWindow):
                         status = "ERROR"
                         error_msg = f"bad params: {e}"
 
-                    # Step 4: read full sheet and extract numeric columns
                     if status == "OK":
                         try:
                             df = book.excel.parse(sheet_name=r.sheet_name)
 
-                            # Confirm the requested columns exist
                             if df.shape[1] < max(col_isd_1b, col_vg_1b):
                                 raise ValueError(f"Sheet has only {df.shape[1]} columns.")
 
-                            # Extract and coerce to numeric
                             s_vg = _coerce_numeric_series(df.iloc[:, col_vg_1b - 1])
                             s_id = _coerce_numeric_series(df.iloc[:, col_isd_1b - 1])
 
-                            # Use only rows where both VG and ID are numeric
                             valid = s_vg.notna() & s_id.notna()
                             vg = s_vg[valid].astype(float).tolist()
                             isd = s_id[valid].astype(float).tolist()
 
-                            # Need enough points for a meaningful fit/plot
                             if len(vg) < 5:
                                 raise ValueError(f"Too few numeric points: {len(vg)}")
                         except Exception as e:
                             status = "ERROR"
                             error_msg = f"read/extract failed: {e}"
 
-                    # Step 5: run analysis and export PNG plot
                     if status == "OK":
-                        # Sanitize filename pieces to avoid illegal path chars
                         stem = _sanitize_filename(Path(r.file_name).stem)
                         sheet_safe = _sanitize_filename(r.sheet_name)
-
-                        # PNG naming: "<index>_<file>_<sheet>.png"
                         out_png = export_path / f"{idx0}_{stem}_{sheet_safe}.png"
 
                         try:
                             title = f"{r.file_name} :: {r.sheet_name}"
 
-                            # Perform analysis and save plot
                             res = analyze_fet_and_save_figure(
                                 vg,
                                 isd,
@@ -1904,11 +1785,10 @@ class MainWindow(QMainWindow):
                                 dev_type=dev_type,
                                 fit_spec=fit_spec,
                                 title=title,
-                                comment=r.comment,  # kept for CSV
+                                comment=r.comment,
                                 out_png=out_png,
                             )
 
-                            # Success: format results into strings for display and CSV
                             ok += 1
                             mobility = f"{res['mobility']:.6E}"
                             vth = f"{res['vth']:.6g}"
@@ -1916,7 +1796,6 @@ class MainWindow(QMainWindow):
                             fit_vmax = f"{res['fit_vmax']:.6g}"
                             r2 = f"{res['r2']:.6g}"
 
-                            # Short per-row summary for the final dialog
                             summary_lines.append(
                                 f"[{idx0}] OK  {r.file_name} :: {r.sheet_name}  mu={mobility} cm/Vs  Vth={vth} V"
                             )
@@ -1924,11 +1803,9 @@ class MainWindow(QMainWindow):
                             status = "ERROR"
                             error_msg = f"analysis failed: {e}"
 
-            # Keep a list of failed rows for final report
             if status != "OK":
                 failed.append(f"[{idx0}] {r.file_name} :: {r.sheet_name}  ({error_msg})")
 
-            # Append a record for CSV writing (includes inputs and outputs)
             results_rows.append(
                 {
                     "#": idx0,
@@ -1941,7 +1818,7 @@ class MainWindow(QMainWindow):
                     "P/N": r.pn,
                     "I-SD_col(1based)": r.i_sd,
                     "V-G_col(1based)": r.v_g,
-                    "comment": r.comment,  # keep in CSV
+                    "comment": r.comment,
                     "status": status,
                     "error": error_msg,
                     "mobility_cm_per_Vs": mobility,
@@ -1952,7 +1829,6 @@ class MainWindow(QMainWindow):
                 }
             )
 
-        # Step 6: write CSV summary file
         try:
             fieldnames = [
                 "#",
@@ -1975,27 +1851,21 @@ class MainWindow(QMainWindow):
                 "R2",
             ]
 
-            # Write with UTF-8-SIG so Excel on Windows opens it with correct encoding.
             with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
                 wcsv = csv.DictWriter(f, fieldnames=fieldnames)
                 wcsv.writeheader()
                 for row in results_rows:
                     wcsv.writerow(row)
         except Exception as e:
-            # If CSV writing fails, the PNG exports may still have succeeded,
-            # so we present a warning rather than crashing.
             QMessageBox.warning(self, "CSV export failed", f"Could not write CSV:\n{csv_path}\n\n{e}")
 
-        # Step 7: show a summary dialog for the whole batch
         msg = [f"Export folder:\n{str(export_path)}", "", f"Done: {ok}/{n}", f"CSV: {csv_path.name}"]
 
-        # Add some successful result previews
         if summary_lines:
             msg += ["", "Results:"] + summary_lines[:30]
             if len(summary_lines) > 30:
                 msg += [f"... ({len(summary_lines)-30} more)"]
 
-        # Add some failures for quick inspection
         if failed:
             msg += ["", "Failed:"] + failed[:30]
             if len(failed) > 30:
@@ -2008,21 +1878,12 @@ class MainWindow(QMainWindow):
 # App entry point
 # ======================================================================================
 def main() -> int:
-    # Create a Qt application object (required for any PySide6 GUI).
     app = QApplication(sys.argv)
-
-    # Apply the desired theme before creating windows/widgets.
     apply_light_fusion_theme(app)
-
-    # Create and show main window.
     w = MainWindow()
     w.show()
-
-    # Start Qt event loop; returns exit code.
     return app.exec()
 
 
-# Standard Python entry guard.
-# This ensures the GUI runs only when invoked as a script, not when imported as a module.
 if __name__ == "__main__":
     raise SystemExit(main())
